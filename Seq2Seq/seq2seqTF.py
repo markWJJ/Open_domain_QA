@@ -1,8 +1,13 @@
+'''
+普通的seq2seq 问答模型
+'''
+
 import  tensorflow as tf
 import sys
 import os
 sys.path.append("../")
 import Data_deal
+from seq2seq_basic import Seq2SeqBasic
 import numpy as np
 import logging
 from seq2seqTF_ops import embedding_encoder,embedding_attention_decoder,embedding_attention_seq2seq,attention_decoder
@@ -23,7 +28,7 @@ class Config(object):
     decoder_len=20
     embedding_dim=50
     hidden_dim=100
-    train_dir='/baidu_zd_small.txt'
+    train_dir='/baidu_zd_500.txt'
     dev_dir='/dev.txt'
     test_dir='/test.txt'
     model_dir='./save_model/seq2seq.ckpt'
@@ -31,10 +36,11 @@ class Config(object):
     use_cpu_num=8
     summary_write_dir="./tmp/seq2seq_my.log"
     epoch=2000
-    encoder_mod="lstm" # Option=[bilstm lstm lstmTF ]
+    encoder_mod="lstmTF" # Option=[bilstm lstm lstmTF cnn ]
     use_sample=False
+    beam_size=5
+    use_MMI=False
 config=Config()
-
 tf.app.flags.DEFINE_float("learning_rate", config.learning_rate, "学习率")
 tf.app.flags.DEFINE_integer("num_samples", config.num_samples, "采样损失函数的采样的样本数")
 tf.app.flags.DEFINE_integer("batch_size", config.batch_size, "批处理的样本数量")
@@ -45,6 +51,7 @@ tf.app.flags.DEFINE_integer("hidden_dim", config.hidden_dim, "中间节点维度
 tf.app.flags.DEFINE_integer("train_num", config.train_num, "训练次数，每次训练加载上次的模型.")
 tf.app.flags.DEFINE_integer("use_cpu_num", config.use_cpu_num, "限定使用cpu的个数")
 tf.app.flags.DEFINE_integer("epoch", config.epoch, "每轮训练迭代次数")
+tf.app.flags.DEFINE_integer("beam_size", config.beam_size, "束搜索规模")
 tf.app.flags.DEFINE_string("summary_write_dir", config.summary_write_dir, "训练数据过程可视化文件保存地址")
 tf.app.flags.DEFINE_string("train_dir", config.train_dir, "训练数据的路径")
 tf.app.flags.DEFINE_string("dev_dir", config.dev_dir, "验证数据文件路径")
@@ -52,12 +59,12 @@ tf.app.flags.DEFINE_string("test_dir", config.test_dir, "测试数据文件路�
 tf.app.flags.DEFINE_string("model_dir", config.model_dir, "模型保存路径")
 tf.app.flags.DEFINE_string("encoder_mod", config.encoder_mod, "编码层使用的模型 lstm bilstm cnn")
 tf.app.flags.DEFINE_boolean("sample_loss", False, "是否采用采样的损失函数") # true for prediction
-tf.app.flags.DEFINE_boolean("train", True, "是否进行训练") # true for prediction
-tf.app.flags.DEFINE_boolean("predict", False, "是否进行预测") # true for prediction
+tf.app.flags.DEFINE_string("mod", "train", "默认为训练") # true for prediction
+tf.app.flags.DEFINE_boolean('use_MMI',config.use_MMI,"是否使用最大互信息来增加解码的多样性")
 FLAGS = tf.app.flags.FLAGS
 
 
-class Seq2Seq(object):
+class Seq2Seq(Seq2SeqBasic):
 
     def __init__(self,hidden_dim,init_dim,content_len,title_len,con_vocab_len,ti_vocab_len,batch_size):
         self.hidden_dim=hidden_dim
@@ -104,6 +111,7 @@ class Seq2Seq(object):
         self.opt=tf.train.AdamOptimizer(0.8).minimize(self.loss)
         self.merge_summary=tf.summary.merge_all()
 
+    def beam_decoder(self):
         # 解码阶段
         self.beam_state_c = tf.placeholder(shape=(None, self.hidden_dim), dtype=tf.float32)
         self.beam_state_h = tf.placeholder(shape=(None, self.hidden_dim), dtype=tf.float32)
@@ -182,7 +190,29 @@ class Seq2Seq(object):
             outs = tf.concat(top_states, 1)
             encoder_state_c=state[0]
             encoder_state_h=state[1]
-        else:
+        elif FLAGS.encoder_mod=="cnn":
+            # convd=[height,width,in_channels,out_channels]
+            # 第一层卷积层的size [4,embedding_dim,1,10]
+            convd_w=tf.Variable(tf.random_uniform(shape=(4,self.init_dim,1,20),minval=-0.1,maxval=0.1),dtype=tf.float32)
+            convd_b=tf.Variable(tf.random_uniform(shape=(20,),dtype=tf.float32))
+            #strides 一个长为4的list. 表示每次卷积以后在input中滑动的距离 strides.shape=inputs.shape [batch_size,height,width,channels]
+            #padding 有SAME和VALID两种选项，表示是否要保留不完全卷积的部分。如果是SAME，则保留
+            # 转换shape cnn层的标准输入：[batch_size,height,width,channels]
+            cnn_input=tf.reshape(self.title_emb,[-1,self.title_len,self.init_dim,1])
+            convd=tf.nn.conv2d(cnn_input,convd_w,strides=[1,1,1,1],padding="SAME") #若滑动stride为1 代表输出维度和输入一致
+            convd_1=tf.nn.relu(tf.add(convd,convd_b)) #[batch_size,self.title_len,self.init_dim,out_channels]
+            convd_pool_1=tf.nn.max_pool(convd_1,ksize=[1,2,2,1],strides=[1,2,2,1],padding="SAME") # size=[batch_size,title_len/2,init_din/2,20]
+            # 第二层 cnn
+            convd_w_2=tf.Variable(tf.random_uniform(shape=(4,2,20,32),minval=-0.1,maxval=0.1),dtype=tf.float32)
+            convd_b_2=tf.Variable(tf.random_uniform(shape=(32,),dtype=tf.float32))
+            convd_2=tf.nn.conv2d(convd_pool_1,convd_w_2,strides=[1,1,1,1],padding="SAME")
+            convd_2=tf.nn.relu(tf.add(convd_2,convd_b_2))
+            convd_out=tf.nn.max_pool(convd_2,ksize=[1,2,1,1],strides=[1,2,1,1],padding="SAME")
+            outs=tf.reshape(convd_out,[-1,100,32])
+            outs=tf.transpose(outs,[0,2,1]) #[batch_size,32,100]
+            encoder_state_c=tf.reduce_mean(outs,axis=1)
+            encoder_state_h=tf.reduce_mean(outs,axis=1)
+        elif FLAGS.encoder_mod=="lstmTF":
             encoder_inputs=tf.unstack(self.title,self.title_len,1)
             attention_states, encoder_state=embedding_encoder(
                 encoder_inputs=encoder_inputs,
@@ -192,6 +222,8 @@ class Seq2Seq(object):
             outs=attention_states
             encoder_state_c=encoder_state
             encoder_state_h=[]
+        else:
+            _logger.error("please input correct encoder_mod!!")
 
         return outs,encoder_state_c,encoder_state_h
 
@@ -202,7 +234,7 @@ class Seq2Seq(object):
         :return: 
         '''
 
-        if FLAGS.encoder_mod=="lstm" or FLAGS.encoder_mod=="bilstm":
+        if FLAGS.encoder_mod in ['lstm','bilstm','cnn']:
             decoder_list = tf.unstack(self.content_emb_input, self.content_len, 1)
             encoder_state = (encoder_state_c, encoder_state_h)
             decoder_out, decoder_state = tf.contrib.legacy_seq2seq.attention_decoder(
@@ -286,70 +318,23 @@ class Seq2Seq(object):
                           name=None)
         return loss
 
-    def beam_search_decoder(self,dd):
-        '''
-        束搜索解码
-        :return:
-        '''
-        self.id2content=dd.id2content
-
-        config = tf.ConfigProto(device_count={"CPU": 8},  # limit to num_cpu_core CPU usage
-                                inter_op_parallelism_threads=8,
-                                intra_op_parallelism_threads=8,
-                                log_device_placement=False)
-
-        saver = tf.train.Saver()
-        self.mod="beam_decoder"
-        with tf.Session(config=config) as sess:
-            saver.restore(sess, "./model_my.ckpt")
-            id2content = dd.id2content
-            # self.feed_previous = True
-            for i in range(2):
-                return_content_input,return_content_decoder, return_title, return_content_len, return_title_len,loss_weight = dd.next_batch()
-
-                init_encoder_out,init_encoder_state_c,init_encoder_state_h=sess.run([self.encoder_outs,self.encoder_state_c,self.encoder_state_h],
-                                                                                    feed_dict={
-                             self.title: return_title,
-                             self.title_seq_vec: return_title_len
-                         })
-                init_beam_input=np.ones(shape=(return_content_len.shape[0],),dtype=np.int32)
-                beam_inputs=[init_beam_input]
-                beam_state_c=[init_encoder_state_c]
-                beam_state_h=[init_encoder_state_h]
-
-                for j in range(return_content_input.shape[1]):
-                    state_,beam_softmax_=sess.run([self.state,self.beam_softmax],
-                                            feed_dict={self.beam_state_c:beam_state_c[-1],
-                                                       self.beam_state_h:beam_state_h[-1],
-                                                       self.beam_inputs:beam_inputs[-1],
-                                                       self.beam_encoder:init_encoder_out}
-                                                )
-
-                    beam_argmax_=np.argmax(beam_softmax_,2)
-                    beam_state_c.append(state_[0])
-                    beam_state_h.append(state_[1])
-                    beam_inputs.append(np.reshape(beam_argmax_,(beam_argmax_.shape[0],)))
-
-                res=np.stack(beam_inputs,1)
-                self.show_result(res,return_content_decoder)
-
     def beam_search_decoder_batch(self, dd):
         '''
         束搜索解码
         :return:
         '''
+        self.beam_decoder()
         self.id2content = dd.id2content
-        self.beam_size=5
-        config = tf.ConfigProto(device_count={"CPU": 8},  # limit to num_cpu_core CPU usage
+        self.beam_size=FLAGS.beam_size
+        config = tf.ConfigProto(device_count={"CPU": FLAGS.use_cpu_num},  # limit to num_cpu_core CPU usage
                                 inter_op_parallelism_threads=8,
                                 intra_op_parallelism_threads=8,
-                                log_device_placement=False)
+                                log_device_placement=True)
 
         saver = tf.train.Saver()
         self.mod = "beam_decoder"
         with tf.Session(config=config) as sess:
-            # saver.restore(sess, "./model_my.ckpt")
-            saver.restore(sess, "./model_5000.ckpt")
+            saver.restore(sess, FLAGS.model_dir)
 
             id2content = dd.id2content
             # self.feed_previous = True
@@ -472,6 +457,7 @@ class Seq2Seq(object):
         train_flag='train'
         with tf.Session(config=config) as sess:
             if os.path.exists(FLAGS.model_dir):
+                _logger.info("load model from %s"%FLAGS.model_dir)
                 saver.restore(sess,FLAGS.model_dir)
             else:
                 sess.run(tf.global_variables_initializer())
@@ -515,31 +501,35 @@ class Seq2Seq(object):
                         print('\n')
 
 def main(_):
-    if FLAGS.train:
-        # 本模型为目的是构建问答系统 因此问句为encoder 答案为decoder
-        _logger.info("训练/验证/测试 数据预处理.....")
-        dd = Data_deal.DataDealSeq(train_path=FLAGS.train_dir, test_path=FLAGS.test_dir,
-                                   dev_path=FLAGS.dev_dir,
-                                   dim=FLAGS.embedding_dim,
-                                   batch_size=FLAGS.batch_size,
-                                   content_len=FLAGS.decoder_len,
-                                   title_len=FLAGS.encoder_len,
-                                   flag="train_new")
-        content_vocab_size, title_vocab_size = dd.get_vocab_size()
-        _logger.info("数据处理完毕")
-        _logger.info("参数列表\n"
-                     "train_dir:%s\nbatch_size:%s\nembedding_dim:%s\nEncoder_len:%s\n"
-                     "Decoder_len:%s\nencoder_vocab_size:%s\ndecoder_vocab_size:%s\nhidden_dim%s "
-                     %(FLAGS.train_dir,FLAGS.batch_size,FLAGS.embedding_dim,FLAGS.encoder_len,
-                       FLAGS.decoder_len,title_vocab_size,content_vocab_size,FLAGS.hidden_dim))
-        _logger.info('*'*50+"构建模型"+'*'*50)
-        model = Seq2Seq(hidden_dim=FLAGS.hidden_dim, init_dim=FLAGS.embedding_dim, content_len=FLAGS.decoder_len, title_len=FLAGS.encoder_len,
-                        con_vocab_len=content_vocab_size, ti_vocab_len=title_vocab_size, batch_size=FLAGS.batch_size)
+    # 本模型为目的是构建问答系统 因此问句为encoder 答案为decoder
+    _logger.info("训练/验证/测试 数据预处理.....")
+    dd = Data_deal.DataDealSeq(train_path=FLAGS.train_dir, test_path=FLAGS.test_dir,
+                               dev_path=FLAGS.dev_dir,
+                               dim=FLAGS.embedding_dim,
+                               batch_size=FLAGS.batch_size,
+                               content_len=FLAGS.decoder_len,
+                               title_len=FLAGS.encoder_len,
+                               flag="train_new")
+    content_vocab_size, title_vocab_size = dd.get_vocab_size()
+    _logger.info("数据处理完毕")
+    _logger.info("参数列表\n"
+                 "train_dir:%s\nbatch_size:%s\nembedding_dim:%s\nEncoder_len:%s\n"
+                 "Decoder_len:%s\nencoder_vocab_size:%s\ndecoder_vocab_size:%s\nhidden_dim%s "
+                 % (FLAGS.train_dir, FLAGS.batch_size, FLAGS.embedding_dim, FLAGS.encoder_len,
+                    FLAGS.decoder_len, title_vocab_size, content_vocab_size, FLAGS.hidden_dim))
+    _logger.info('*' * 50 + "构建模型" + '*' * 50)
+    model = Seq2Seq(hidden_dim=FLAGS.hidden_dim, init_dim=FLAGS.embedding_dim, content_len=FLAGS.decoder_len,
+                    title_len=FLAGS.encoder_len,
+                    con_vocab_len=content_vocab_size, ti_vocab_len=title_vocab_size, batch_size=FLAGS.batch_size)
+
+    if FLAGS.mod=='train':
         for i in range(FLAGS.train_num):
             _logger.info("开始第%s轮训练"%i)
             model.train(dd)
-        # model.beam_search_decoder_batch(dd)
-        #
+    elif FLAGS.mod=='predict':
+        _logger.info("预测")
+        model.beam_search_decoder_batch(dd)
+
 if __name__ == '__main__':
     tf.app.run()
 
