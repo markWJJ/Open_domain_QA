@@ -40,6 +40,7 @@ class Config(object):
     use_sample=False
     beam_size=168
     use_MMI=False
+
 config=Config()
 tf.app.flags.DEFINE_float("learning_rate", config.learning_rate, "学习率")
 tf.app.flags.DEFINE_integer("num_samples", config.num_samples, "采样损失函数的采样的样本数")
@@ -58,7 +59,7 @@ tf.app.flags.DEFINE_string("dev_dir", config.dev_dir, "验证数据文件路径"
 tf.app.flags.DEFINE_string("test_dir", config.test_dir, "测试数据文件路径")
 tf.app.flags.DEFINE_string("model_dir", config.model_dir, "模型保存路径")
 tf.app.flags.DEFINE_string("encoder_mod", config.encoder_mod, "编码层使用的模型 lstm bilstm cnn")
-tf.app.flags.DEFINE_boolean("sample_loss", False, "是否采用采样的损失函数") # true for prediction
+tf.app.flags.DEFINE_boolean("sample_loss", True, "是否采用采样的损失函数") # true for prediction
 tf.app.flags.DEFINE_string("mod", "train", "默认为训练") # true for prediction
 tf.app.flags.DEFINE_boolean('use_MMI',config.use_MMI,"是否使用最大互信息来增加解码的多样性")
 FLAGS = tf.app.flags.FLAGS
@@ -268,8 +269,8 @@ class Seq2Seq(object):
         :return: 
         '''
         if FLAGS.encoder_mod=="bilstm":
-            w = tf.Variable(tf.random_uniform(shape=(self.num_class, 2*self.hidden_dim), dtype=tf.float32))
-            b = tf.Variable(tf.random_uniform(shape=(self.num_class,), dtype=tf.float32))
+            self.w = tf.Variable(tf.random_uniform(shape=(self.num_class, 2*self.hidden_dim), dtype=tf.float32))
+            self.b = tf.Variable(tf.random_uniform(shape=(self.num_class,), dtype=tf.float32))
             logits=tf.stack(logit_list,1)
             ll = tf.einsum('ijk,kl->ijl', logits, tf.transpose(w))
             self.softmax_logit = tf.nn.softmax(tf.add(ll, b), 1)
@@ -281,11 +282,11 @@ class Seq2Seq(object):
                 losses = []
                 for logit, label in zip(logit_list, labels):
                     label = tf.reshape(label, (-1, 1))
-                    loss = tf.nn.sampled_softmax_loss(weights=w,
-                                                      biases=b,
+                    loss = tf.nn.sampled_softmax_loss(weights=self.w,
+                                                      biases=self.b,
                                                       labels=label,
                                                       inputs=logit,
-                                                      num_sampled=1000,
+                                                      num_sampled=FLAGS.num_samples,
                                                       num_classes=self.num_class)
                     losses.append(loss)
                 losses = tf.stack(losses)
@@ -301,22 +302,35 @@ class Seq2Seq(object):
                 label_one_hot = tf.one_hot(label, self.content_vocab_len, 1, 0, 2)
                 loss = tf.losses.softmax_cross_entropy(logits=self.softmax_logit, onehot_labels=label_one_hot)
             else:
-                def sampled_loss_func(labels, inputs):
-                    labels = tf.reshape(labels, [-1, 1])
-                    return tf.nn.sampled_softmax_loss(
-                        weights=w, biases=b, labels=labels, inputs=inputs,
-                        num_sampled=self.content_vocab_len, num_classes=self.content_vocab_len)
-                logits =logit_list
+                # def sampled_loss_func(labels, inputs):
+                #     labels = tf.reshape(labels, [-1, 1])
+                #     return tf.nn.sampled_softmax_loss(
+                #         weights=self.w, biases=self.b, labels=labels, inputs=inputs,
+                #         num_sampled=FLAGS.num_samples, num_classes=self.content_vocab_len)
+                # logits =logit_list
+                # labels = tf.unstack(label, self.content_len, 1)
+                # # loss_weights = tf.unstack(self.loss_weight, self.content_len, 1)
+                # loss=tf.contrib.legacy_seq2seq.sequence_loss(
+                #           logits=logits,
+                #           targets=labels,
+                #           weights=None,
+                #           average_across_timesteps=True,
+                #           average_across_batch=True,
+                #           softmax_loss_function=sampled_loss_func,
+                #           name=None)
                 labels = tf.unstack(label, self.content_len, 1)
-                # loss_weights = tf.unstack(self.loss_weight, self.content_len, 1)
-                loss=tf.contrib.legacy_seq2seq.sequence_loss(
-                          logits=logits,
-                          targets=labels,
-                          weights=None,
-                          average_across_timesteps=True,
-                          average_across_batch=True,
-                          softmax_loss_function=sampled_loss_func,
-                          name=None)
+                losses = []
+                for logit, label in zip(logit_list, labels):
+                    label = tf.reshape(label, (-1, 1))
+                    loss = tf.nn.sampled_softmax_loss(weights=self.w,
+                                                      biases=self.b,
+                                                      labels=label,
+                                                      inputs=logit,
+                                                      num_sampled=FLAGS.num_samples,
+                                                      num_classes=self.num_class)
+                    losses.append(loss)
+                losses = tf.stack(losses)
+                loss = tf.reduce_mean(losses)
         return loss
 
     def __array_convert(self,beam_data,score,beam_path,beam_size,beam_flag="Med"):
