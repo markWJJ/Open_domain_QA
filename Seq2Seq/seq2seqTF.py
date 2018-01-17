@@ -28,17 +28,17 @@ class Config(object):
     decoder_len=20
     embedding_dim=50
     hidden_dim=100
-    train_dir='/baidu_zd_500.txt'
+    train_dir='/baidu_zd_small.txt'
     dev_dir='/dev.txt'
     test_dir='/test.txt'
-    model_dir='./save_model/seq2seq.ckpt'
+    model_dir='./save_model/seq2seq_.ckpt'
     train_num=50
     use_cpu_num=8
     summary_write_dir="./tmp/seq2seq_my.log"
-    epoch=2000
-    encoder_mod="lstmTF" # Option=[bilstm lstm lstmTF cnn ]
+    epoch=100
+    encoder_mod="lstm" # Option=[bilstm lstm lstmTF cnn ]
     use_sample=False
-    beam_size=5
+    beam_size=168
     use_MMI=False
 config=Config()
 tf.app.flags.DEFINE_float("learning_rate", config.learning_rate, "学习率")
@@ -64,7 +64,7 @@ tf.app.flags.DEFINE_boolean('use_MMI',config.use_MMI,"是否使用最大互信�
 FLAGS = tf.app.flags.FLAGS
 
 
-class Seq2Seq(Seq2SeqBasic):
+class Seq2Seq(object):
 
     def __init__(self,hidden_dim,init_dim,content_len,title_len,con_vocab_len,ti_vocab_len,batch_size):
         self.hidden_dim=hidden_dim
@@ -108,7 +108,7 @@ class Seq2Seq(Seq2SeqBasic):
         decoder_out,decoder_state=self.Decoder(encoder_outs,encoder_state_c,encoder_state_h)
         self.loss=self.Loss(decoder_out,self.content_decoder)
         tf.summary.scalar("loss_my",self.loss)
-        self.opt=tf.train.AdamOptimizer(0.8).minimize(self.loss)
+        self.opt=tf.train.AdamOptimizer(FLAGS.learning_rate).minimize(self.loss)
         self.merge_summary=tf.summary.merge_all()
 
     def beam_decoder(self):
@@ -293,6 +293,7 @@ class Seq2Seq(Seq2SeqBasic):
         else:
             self.w = tf.Variable(tf.random_uniform(shape=(self.num_class,  self.hidden_dim), dtype=tf.float32))
             self.b = tf.Variable(tf.random_uniform(shape=(self.num_class,), dtype=tf.float32))
+
             logits = tf.stack(logit_list, 1)
             ll = tf.einsum('ijk,kl->ijl', logits, tf.transpose(self.w))
             self.softmax_logit = tf.add(ll, self.b)
@@ -317,75 +318,6 @@ class Seq2Seq(Seq2SeqBasic):
                           softmax_loss_function=sampled_loss_func,
                           name=None)
         return loss
-
-    def beam_search_decoder_batch(self, dd):
-        '''
-        束搜索解码
-        :return:
-        '''
-        self.beam_decoder()
-        self.id2content = dd.id2content
-        self.beam_size=FLAGS.beam_size
-        config = tf.ConfigProto(device_count={"CPU": FLAGS.use_cpu_num},  # limit to num_cpu_core CPU usage
-                                inter_op_parallelism_threads=8,
-                                intra_op_parallelism_threads=8,
-                                log_device_placement=True)
-
-        saver = tf.train.Saver()
-        self.mod = "beam_decoder"
-        with tf.Session(config=config) as sess:
-            saver.restore(sess, FLAGS.model_dir)
-
-            id2content = dd.id2content
-            # self.feed_previous = True
-            for _ in range(1):
-                return_content_input, return_content_decoder, return_title, return_content_len, return_title_len, loss_weight = dd.next_batch()
-
-
-                for batch_index in range(return_title.shape[0]):
-                    self.socre=[0.0]*self.beam_size
-                    self.beam_path=[[1]]*self.beam_size
-
-                    title_input=[return_title[batch_index]]*self.beam_size
-                    title_seq_input=[return_title_len[batch_index]]*self.beam_size
-                    title_input=np.array(title_input)
-                    title_seq_input=np.array(title_seq_input)
-
-                    init_encoder_out, init_encoder_state_c, init_encoder_state_h = sess.run(
-                        [self.encoder_outs, self.encoder_state_c, self.encoder_state_h],
-                        feed_dict={
-                            self.title: title_input,
-                            self.title_seq_vec: title_seq_input
-                        })
-                    init_beam_input = np.ones(shape=(self.beam_size,), dtype=np.int32)
-                    beam_inputs = [init_beam_input]
-                    beam_state_c = [init_encoder_state_c]
-                    beam_state_h = [init_encoder_state_h]
-
-                    for j in range(return_content_input.shape[1]):
-                        state_, beam_softmax_ = sess.run([self.state, self.beam_softmax],
-                                                         feed_dict={self.beam_state_c: beam_state_c[-1],
-                                                                    self.beam_state_h: beam_state_h[-1],
-                                                                    self.beam_inputs: beam_inputs[-1],
-                                                                    self.beam_encoder: init_encoder_out})
-                        if j==0:
-
-                            path,socre,next_input=self.__array_convert(beam_softmax_,self.socre,self.beam_path,self.beam_size,beam_flag="Beg")
-                            self.socre=socre
-                            self.beam_path=path
-                        else:
-                            path, socre, next_input=self.__array_convert(beam_softmax_,self.socre,self.beam_path,self.beam_size,beam_flag="Med")
-                            self.socre = socre
-                            self.beam_path = path
-
-                        beam_state_c.append(state_[0])
-                        beam_state_h.append(state_[1])
-                        beam_inputs.append(next_input)
-
-                    print(self.socre)
-                    print(self.beam_path)
-                    print(return_content_decoder[batch_index])
-                    print('*'*10)
 
     def __array_convert(self,beam_data,score,beam_path,beam_size,beam_flag="Med"):
         '''
@@ -450,7 +382,7 @@ class Seq2Seq(Seq2SeqBasic):
         config = tf.ConfigProto(device_count={"CPU": FLAGS.use_cpu_num},  # limit to num_cpu_core CPU usage
                                 inter_op_parallelism_threads=8,
                                 intra_op_parallelism_threads=8,
-                                log_device_placement=True)
+                                log_device_placement=False)
         id2content=dd.id2content
         saver = tf.train.Saver()
         summary_write=tf.summary.FileWriter(FLAGS.summary_write_dir)
@@ -472,7 +404,6 @@ class Seq2Seq(Seq2SeqBasic):
                         self.content_seq_vec:return_content_len,
                         self.title_seq_vec:return_title_len
                         })
-
                     summary_write.add_summary(su_merge,i)
                     if loss<self.init_loss:
                         self.init_loss=loss
@@ -499,6 +430,75 @@ class Seq2Seq(Seq2SeqBasic):
                         content = "".join(list(map(lambda x: id2content[int(x)], content))).replace('NONE',"")
                         print(pre,"---",content)
                         print('\n')
+
+    def beam_search_decoder_batch(self, dd):
+        '''
+        束搜索解码
+        :return:
+        '''
+        self.beam_decoder()
+        self.id2content = dd.id2content
+        self.beam_size=FLAGS.beam_size
+        config = tf.ConfigProto(device_count={"CPU": FLAGS.use_cpu_num},  # limit to num_cpu_core CPU usage
+                                inter_op_parallelism_threads=8,
+                                intra_op_parallelism_threads=8,
+                                log_device_placement=False)
+
+        saver = tf.train.Saver()
+        self.mod = "beam_decoder"
+        with tf.Session(config=config) as sess:
+            saver.restore(sess, FLAGS.model_dir)
+
+            id2content = dd.id2content
+            # self.feed_previous = True
+            for _ in range(1):
+                return_content_input, return_content_decoder, return_title, return_content_len, return_title_len, loss_weight = dd.next_batch()
+
+
+                for batch_index in range(return_title.shape[0]):
+                    self.socre=[0.0]*self.beam_size
+                    self.beam_path=[[1]]*self.beam_size
+
+                    title_input=[return_title[batch_index]]*self.beam_size
+                    title_seq_input=[return_title_len[batch_index]]*self.beam_size
+                    title_input=np.array(title_input)
+                    title_seq_input=np.array(title_seq_input)
+
+                    init_encoder_out, init_encoder_state_c, init_encoder_state_h = sess.run(
+                        [self.encoder_outs, self.encoder_state_c, self.encoder_state_h],
+                        feed_dict={
+                            self.title: title_input,
+                            self.title_seq_vec: title_seq_input
+                        })
+                    init_beam_input = np.ones(shape=(self.beam_size,), dtype=np.int32)
+                    beam_inputs = [init_beam_input]
+                    beam_state_c = [init_encoder_state_c]
+                    beam_state_h = [init_encoder_state_h]
+
+                    for j in range(return_content_input.shape[1]):
+                        state_, beam_softmax_ = sess.run([self.state, self.beam_softmax],
+                                                         feed_dict={self.beam_state_c: beam_state_c[-1],
+                                                                    self.beam_state_h: beam_state_h[-1],
+                                                                    self.beam_inputs: beam_inputs[-1],
+                                                                    self.beam_encoder: init_encoder_out})
+                        if j==0:
+
+                            path,socre,next_input=self.__array_convert(beam_softmax_,self.socre,self.beam_path,self.beam_size,beam_flag="Beg")
+                            self.socre=socre
+                            self.beam_path=path
+                        else:
+                            path, socre, next_input=self.__array_convert(beam_softmax_,self.socre,self.beam_path,self.beam_size,beam_flag="Med")
+                            self.socre = socre
+                            self.beam_path = path
+
+                        beam_state_c.append(state_[0])
+                        beam_state_h.append(state_[1])
+                        beam_inputs.append(next_input)
+
+                    print(self.socre)
+                    print(self.beam_path)
+                    print(return_content_decoder[batch_index])
+                    print('*'*10)
 
 def main(_):
     # 本模型为目的是构建问答系统 因此问句为encoder 答案为decoder

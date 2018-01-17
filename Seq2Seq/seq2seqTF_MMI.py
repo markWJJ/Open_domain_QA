@@ -1,5 +1,5 @@
 '''
-普通的seq2seq 问答模型
+带MMI的seq2seq 问答模型
 '''
 
 import  tensorflow as tf
@@ -59,7 +59,7 @@ tf.app.flags.DEFINE_string("test_dir", config.test_dir, "测试数据文件路�
 tf.app.flags.DEFINE_string("model_dir", config.model_dir, "模型保存路径")
 tf.app.flags.DEFINE_string("encoder_mod", config.encoder_mod, "编码层使用的模型 lstm bilstm cnn")
 tf.app.flags.DEFINE_boolean("sample_loss", False, "是否采用采样的损失函数") # true for prediction
-tf.app.flags.DEFINE_string("mod", "predict", "默认为训练") # train or predict
+tf.app.flags.DEFINE_string("mod", "train", "默认为训练") # train or predict
 tf.app.flags.DEFINE_boolean('use_MMI',config.use_MMI,"是否使用最大互信息来增加解码的多样性")
 FLAGS = tf.app.flags.FLAGS
 
@@ -99,10 +99,18 @@ class Seq2Seq(Seq2SeqBasic):
         # 构建decoder层词向量矩阵变量
         self.embeding_title = tf.Variable(tf.random_uniform(shape=(self.title_vocab_len, self.init_dim),
                                                             dtype=tf.float32))
-        # 定义lstm 单元
-        self.cell = tf.contrib.rnn.LSTMCell(self.hidden_dim,
-                                            initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                            state_is_tuple=True)
+        # 定义 正向编码层的lstm 单元 即 问句(编码)--回应(解码)
+        with tf.variable_scope("encoder_f"):
+
+            self.cell_f = tf.contrib.rnn.LSTMCell(self.hidden_dim,
+                                                initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                                state_is_tuple=True)
+
+        # 定义 反向编码层的lstm 单元 即 回应(编码)--问句(解码)
+        with tf.variable_scope("encoder_b"):
+            self.cell_b = tf.contrib.rnn.LSTMCell(self.hidden_dim,
+                                                  initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                                  state_is_tuple=True)
 
         self.content_emb_input = tf.nn.embedding_lookup(self.embeding_content, self.content_input)
         self.content_emb_decoder = tf.nn.embedding_lookup(self.embeding_content, self.content_decoder)
@@ -122,84 +130,86 @@ class Seq2Seq(Seq2SeqBasic):
                 # self.decoder_w = tf.Variable(tf.random_uniform(shape=(self.num_class, self.hidden_dim), dtype=tf.float32),name='decoder_w')
                 # self.decoder_b = tf.Variable(tf.random_uniform(shape=(self.num_class,), dtype=tf.float32),name='decoder_b')
 
+
     def __encoder__(self,encoder_inputs,encoder_len,**kwargs):
         '''
-        编码层
+        编码层, 
         :return: 
         '''
-        hidden_dim=kwargs['hidden_dim']
-        encoder_sequence_length=kwargs['encoder_sequence_length']
-        lstm_input=tf.unstack(encoder_inputs,encoder_len,1)
-        cell=kwargs['cell']
-        init_dim=kwargs['init_dim']
-        encoder_orgion=kwargs['encoder_orgion']
-        encoder_vocab_size=kwargs['encoder_vocab_size']
+        with tf.variable_scope(name_or_scope=kwargs['scope']):
+            hidden_dim=kwargs['hidden_dim']
+            encoder_sequence_length=kwargs['encoder_sequence_length']
+            lstm_input=tf.unstack(encoder_inputs,encoder_len,1)
+            cell=kwargs['cell']
+            init_dim=kwargs['init_dim']
+            encoder_orgion=kwargs['encoder_orgion']
+            encoder_vocab_size=kwargs['encoder_vocab_size']
 
-        if FLAGS.encoder_mod=="bilstm":
-            cell_f=tf.contrib.rnn.LSTMCell(hidden_dim,
-                                            initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                            state_is_tuple=True)
-            cell_b=tf.contrib.rnn.LSTMCell(hidden_dim,
-                                            initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                            state_is_tuple=True)
-            (out, fw_state, bw_state) = tf.contrib.rnn.static_bidirectional_rnn(cell_f, cell_b, lstm_input,
-                                                                         dtype=tf.float32,
-                                                                         sequence_length=encoder_sequence_length)
+            if FLAGS.encoder_mod=="bilstm":
+                cell_f=tf.contrib.rnn.LSTMCell(hidden_dim,
+                                                initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                                state_is_tuple=True)
+                cell_b=tf.contrib.rnn.LSTMCell(hidden_dim,
+                                                initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                                state_is_tuple=True)
+                (out, fw_state, bw_state) = tf.contrib.rnn.static_bidirectional_rnn(cell_f, cell_b, lstm_input,
+                                                                             dtype=tf.float32,
+                                                                             sequence_length=encoder_sequence_length)
 
-            encoder_state_c=tf.concat((fw_state[0],bw_state[0]),1)
-            encoder_state_h=tf.concat((fw_state[1],bw_state[1]),1)
-            outs=tf.stack(out)
-            outs=tf.reshape(outs,[-1,encoder_len,2*hidden_dim])
+                encoder_state_c=tf.concat((fw_state[0],bw_state[0]),1)
+                encoder_state_h=tf.concat((fw_state[1],bw_state[1]),1)
+                outs=tf.stack(out)
+                outs=tf.reshape(outs,[-1,encoder_len,2*hidden_dim])
 
-        elif FLAGS.encoder_mod=="lstm":
+            elif FLAGS.encoder_mod=="lstm":
 
-            out, state = tf.contrib.rnn.static_rnn(cell, lstm_input,
-                                                    dtype=tf.float32,
-                                                    sequence_length=encoder_sequence_length)
-            top_states = [
-                tf.reshape(e, [-1, 1, hidden_dim]) for e in out
-            ]
-            outs = tf.concat(top_states, 1)
-            encoder_state_c=state[0]
-            encoder_state_h=state[1]
+                out, state = tf.contrib.rnn.static_rnn(cell, lstm_input,
+                                                        dtype=tf.float32,
+                                                        sequence_length=encoder_sequence_length)
+                top_states = [
+                    tf.reshape(e, [-1, 1, hidden_dim]) for e in out
+                ]
+                outs = tf.concat(top_states, 1)
+                encoder_state_c=state[0]
+                encoder_state_h=state[1]
 
-        elif FLAGS.encoder_mod=="cnn":
-            # convd=[height,width,in_channels,out_channels]
-            # 第一层卷积层的size [4,embedding_dim,1,10]
-            convd_w=tf.Variable(tf.random_uniform(shape=(4,init_dim,1,20),minval=-0.1,maxval=0.1),dtype=tf.float32)
-            convd_b=tf.Variable(tf.random_uniform(shape=(20,),dtype=tf.float32))
-            #strides 一个长为4的list. 表示每次卷积以后在input中滑动的距离 strides.shape=inputs.shape [batch_size,height,width,channels]
-            #padding 有SAME和VALID两种选项，表示是否要保留不完全卷积的部分。如果是SAME，则保留
-            # 转换shape cnn层的标准输入：[batch_size,height,width,channels]
-            cnn_input=tf.reshape(encoder_len,[-1,encoder_len,init_dim,1])
-            convd=tf.nn.conv2d(cnn_input,convd_w,strides=[1,1,1,1],padding="SAME") #若滑动stride为1 代表输出维度和输入一致
-            convd_1=tf.nn.relu(tf.add(convd,convd_b)) #[batch_size,self.title_len,self.init_dim,out_channels]
-            convd_pool_1=tf.nn.max_pool(convd_1,ksize=[1,2,2,1],strides=[1,2,2,1],padding="SAME") # size=[batch_size,title_len/2,init_din/2,20]
-            # 第二层 cnn
-            convd_w_2=tf.Variable(tf.random_uniform(shape=(4,2,20,32),minval=-0.1,maxval=0.1),dtype=tf.float32)
-            convd_b_2=tf.Variable(tf.random_uniform(shape=(32,),dtype=tf.float32))
-            convd_2=tf.nn.conv2d(convd_pool_1,convd_w_2,strides=[1,1,1,1],padding="SAME")
-            convd_2=tf.nn.relu(tf.add(convd_2,convd_b_2))
-            convd_out=tf.nn.max_pool(convd_2,ksize=[1,2,1,1],strides=[1,2,1,1],padding="SAME")
-            outs=tf.reshape(convd_out,[-1,100,32])
-            outs=tf.transpose(outs,[0,2,1]) #[batch_size,32,100]
-            encoder_state_c=tf.reduce_mean(outs,axis=1)
-            encoder_state_h=tf.reduce_mean(outs,axis=1)
+            elif FLAGS.encoder_mod=="cnn":
+                # convd=[height,width,in_channels,out_channels]
+                # 第一层卷积层的size [4,embedding_dim,1,10]
+                convd_w=tf.Variable(tf.random_uniform(shape=(4,init_dim,1,20),minval=-0.1,maxval=0.1),dtype=tf.float32)
+                convd_b=tf.Variable(tf.random_uniform(shape=(20,),dtype=tf.float32))
+                #strides 一个长为4的list. 表示每次卷积以后在input中滑动的距离 strides.shape=inputs.shape [batch_size,height,width,channels]
+                #padding 有SAME和VALID两种选项，表示是否要保留不完全卷积的部分。如果是SAME，则保留
+                # 转换shape cnn层的标准输入：[batch_size,height,width,channels]
+                cnn_input=tf.reshape(encoder_len,[-1,encoder_len,init_dim,1])
+                convd=tf.nn.conv2d(cnn_input,convd_w,strides=[1,1,1,1],padding="SAME") #若滑动stride为1 代表输出维度和输入一致
+                convd_1=tf.nn.relu(tf.add(convd,convd_b)) #[batch_size,self.title_len,self.init_dim,out_channels]
+                convd_pool_1=tf.nn.max_pool(convd_1,ksize=[1,2,2,1],strides=[1,2,2,1],padding="SAME") # size=[batch_size,title_len/2,init_din/2,20]
+                # 第二层 cnn
+                convd_w_2=tf.Variable(tf.random_uniform(shape=(4,2,20,32),minval=-0.1,maxval=0.1),dtype=tf.float32)
+                convd_b_2=tf.Variable(tf.random_uniform(shape=(32,),dtype=tf.float32))
+                convd_2=tf.nn.conv2d(convd_pool_1,convd_w_2,strides=[1,1,1,1],padding="SAME")
+                convd_2=tf.nn.relu(tf.add(convd_2,convd_b_2))
+                convd_out=tf.nn.max_pool(convd_2,ksize=[1,2,1,1],strides=[1,2,1,1],padding="SAME")
+                outs=tf.reshape(convd_out,[-1,100,32])
+                outs=tf.transpose(outs,[0,2,1]) #[batch_size,32,100]
+                encoder_state_c=tf.reduce_mean(outs,axis=1)
+                encoder_state_h=tf.reduce_mean(outs,axis=1)
 
-        elif FLAGS.encoder_mod=="lstmTF":
-            encoder_inputs=tf.unstack(encoder_orgion,encoder_len,1)
-            attention_states, encoder_state=embedding_encoder(
-                encoder_inputs=encoder_inputs,
-                              cell=cell,
-                              num_encoder_symbols=encoder_vocab_size,
-                              embedding_size=init_dim)
-            outs=attention_states
-            encoder_state_c=encoder_state
-            encoder_state_h=[]
-        else:
-            _logger.error("please input correct encoder_mod!!")
+            elif FLAGS.encoder_mod=="lstmTF":
+                encoder_inputs=tf.unstack(encoder_orgion,encoder_len,1)
+                attention_states, encoder_state=embedding_encoder(
+                    encoder_inputs=encoder_inputs,
+                                  cell=cell,
+                                  num_encoder_symbols=encoder_vocab_size,
+                                  embedding_size=init_dim)
+                outs=attention_states
+                encoder_state_c=encoder_state
+                encoder_state_h=[]
+            else:
+                _logger.error("please input correct encoder_mod!!")
 
-        return outs,encoder_state_c,encoder_state_h
+            return outs,encoder_state_c,encoder_state_h
 
     def __decoder__(self,encoder_outs,encoder_state_c,encoder_state_h,**kwargs):
         '''
@@ -209,38 +219,39 @@ class Seq2Seq(Seq2SeqBasic):
         :param encoder_state_h: 
         :return: 
         '''
-        cell=kwargs['cell']
-        decoder_inputs_emb=kwargs['decoder_inputs_emb']
-        decoder_len=kwargs['decoder_len']
-        decoder_inputs=kwargs['decoder_inputs']
-        decoder_vocab_size=kwargs['decoder_vocab_size']
-        init_dim=kwargs['init_dim']
-        if FLAGS.encoder_mod in ['lstm','bilstm','cnn']:
-            decoder_list = tf.unstack(decoder_inputs_emb, decoder_len, 1)
-            encoder_state = (encoder_state_c, encoder_state_h)
-            decoder_out, decoder_state = tf.contrib.legacy_seq2seq.attention_decoder(
-                decoder_inputs=decoder_list,
-                initial_state=encoder_state,
-                attention_states=encoder_outs,
-                cell=cell,
-                output_size=None,
-            )
-        else:
-            decoder_inputs=tf.unstack(decoder_inputs,decoder_len,1)
-            decoder_out, decoder_state=embedding_attention_decoder(
-                decoder_inputs=decoder_inputs,
-                initial_state=encoder_state_c,
-                attention_states=encoder_outs,
-                cell=cell,
-                num_symbols=decoder_vocab_size,
-                embedding_size=init_dim,
-                num_heads=1,
-                output_size=None,
-                output_projection=None,
-                feed_previous=False,
-                initial_state_attention=False)
-        decoder_out=tf.stack(decoder_out,1)
-        return decoder_out,decoder_state
+        with tf.variable_scope(name_or_scope=kwargs['scope']):
+            cell=kwargs['cell']
+            decoder_inputs_emb=kwargs['decoder_inputs_emb']
+            decoder_len=kwargs['decoder_len']
+            decoder_inputs=kwargs['decoder_inputs']
+            decoder_vocab_size=kwargs['decoder_vocab_size']
+            init_dim=kwargs['init_dim']
+            if FLAGS.encoder_mod in ['lstm','bilstm','cnn']:
+                decoder_list = tf.unstack(decoder_inputs_emb, decoder_len, 1)
+                encoder_state = (encoder_state_c, encoder_state_h)
+                decoder_out, decoder_state = tf.contrib.legacy_seq2seq.attention_decoder(
+                    decoder_inputs=decoder_list,
+                    initial_state=encoder_state,
+                    attention_states=encoder_outs,
+                    cell=cell,
+                    output_size=None,
+                )
+            else:
+                decoder_inputs=tf.unstack(decoder_inputs,decoder_len,1)
+                decoder_out, decoder_state=embedding_attention_decoder(
+                    decoder_inputs=decoder_inputs,
+                    initial_state=encoder_state_c,
+                    attention_states=encoder_outs,
+                    cell=cell,
+                    num_symbols=decoder_vocab_size,
+                    embedding_size=init_dim,
+                    num_heads=1,
+                    output_size=None,
+                    output_projection=None,
+                    feed_previous=False,
+                    initial_state_attention=False)
+            decoder_out=tf.stack(decoder_out,1)
+            return decoder_out,decoder_state
 
     def __loss__(self,decoder_outs,label,**kwargs):
         '''
@@ -309,22 +320,44 @@ class Seq2Seq(Seq2SeqBasic):
         :return: 
         '''
         # self.Encoder_Decoder()
-        kwargs_encoder={"hidden_dim":self.hidden_dim,
+        kwargs_encoder_f={"hidden_dim":self.hidden_dim,
                         "encoder_sequence_length":self.title_seq_vec,
-                        "cell":self.cell,
+                        "cell":self.cell_f,
                         "init_dim":self.init_dim,
                         "encoder_orgion":self.title,
-                        "encoder_vocab_size":self.title_vocab_len}
-        encoder_outs, encoder_state_c, encoder_state_h = self.__encoder__(self.title_emb,self.title_len,**kwargs_encoder)
+                        "encoder_vocab_size":self.title_vocab_len,
+                        "scope":'encoder_f'}
+        encoder_outs_f, encoder_state_c_f, encoder_state_h_f = self.__encoder__(self.title_emb,self.title_len,**kwargs_encoder_f)
 
-        kwargs_decoder={"cell":self.cell,
+        kwargs_decoder_f={"cell":self.cell_f,
                         "decoder_inputs_emb":self.content_emb_input,
                         "decoder_len":self.content_len,
                         "decoder_inputs":self.content_input,
                         "decoder_vocab_size":self.content_vocab_len,
-                        "init_dim":self.init_dim
+                        "init_dim":self.init_dim,
+                        'scope':'decoder_f'
                         }
-        decoder_out, decoder_state = self.__decoder__(encoder_outs, encoder_state_c, encoder_state_h,**kwargs_decoder)
+        decoder_out_f, decoder_state_f = self.__decoder__(encoder_outs_f, encoder_state_c_f, encoder_state_h_f,**kwargs_decoder_f)
+
+        kwargs_encoder_b = {"hidden_dim": self.hidden_dim,
+                            "encoder_sequence_length": self.content_seq_vec,
+                            "cell": self.cell_b,
+                            "init_dim": self.init_dim,
+                            "encoder_orgion": self.content_input,
+                            "encoder_vocab_size": self.content_vocab_len,
+                            "scope": 'encoder_b'}
+        encoder_outs_b, encoder_state_c_b, encoder_state_h_b = self.__encoder__(self.content_emb_input, self.content_len,
+                                                                                **kwargs_encoder_b)
+        kwargs_decoder_f = {"cell": self.cell,
+                            "decoder_inputs_emb": self.content_emb_input,
+                            "decoder_len": self.content_len,
+                            "decoder_inputs": self.content_input,
+                            "decoder_vocab_size": self.content_vocab_len,
+                            "init_dim": self.init_dim,
+                            'scope': 'decoder_f'
+                            }
+        decoder_out_f, decoder_state_f = self.__decoder__(encoder_outs_f, encoder_state_c_f, encoder_state_h_f,
+                                                          **kwargs_decoder_f)
 
         loss_kwargs={"num_class":self.num_class,
                      "hidden_dim":self.hidden_dim,
