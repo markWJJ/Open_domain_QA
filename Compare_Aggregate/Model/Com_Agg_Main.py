@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-from Compare_Aggregate.Data import Data_deal
+from Data import Data_deal
 import logging
 import os
 logging.basicConfig(level=logging.INFO,

@@ -31,11 +31,11 @@ class Config(object):
     train_dir='/baidu_zd_small.txt'
     dev_dir='/dev.txt'
     test_dir='/test.txt'
-    model_dir='./save_model/seq2seq_.ckpt'
+    model_dir='./save_model/seq2seq_bilstm_.ckpt'
     train_num=50
     use_cpu_num=8
     summary_write_dir="./tmp/seq2seq_my.log"
-    epoch=100
+    epoch=1000
     encoder_mod="lstm" # Option=[bilstm lstm lstmTF cnn ]
     use_sample=False
     beam_size=168
@@ -76,31 +76,61 @@ class Seq2Seq(object):
         self.title_vocab_len=ti_vocab_len
         self.batch_size=batch_size
         self.num_class=con_vocab_len
-        self.content_input=tf.placeholder(dtype=tf.int32,shape=(None,self.content_len))
-        self.content_decoder=tf.placeholder(dtype=tf.int32,shape=(None,self.content_len))
+
+        self.content_input=tf.placeholder(dtype=tf.int32,shape=(None,self.content_len),name='content_input')
+        self.content_decoder=tf.placeholder(dtype=tf.int32,shape=(None,self.content_len),name='content_decoder')
         self.mod="beam_decoder"
-        self.title=tf.placeholder(dtype=tf.int32,shape=(None,self.title_len))
-        self.content_seq_vec=tf.placeholder(dtype=tf.int32,shape=(None,))
-        self.title_seq_vec=tf.placeholder(dtype=tf.int32,shape=(None,))
+        self.title=tf.placeholder(dtype=tf.int32,shape=(None,self.title_len),name='title')
+        self.content_seq_vec=tf.placeholder(dtype=tf.int32,shape=(None,),name='content_seq_vec')
+        self.title_seq_vec=tf.placeholder(dtype=tf.int32,shape=(None,),name='title_seq_vec')
+        tf.add_to_collection("input_placehold",self.content_input)
+        tf.add_to_collection("input_placehold",self.content_decoder)
+        tf.add_to_collection("input_placehold",self.title)
+        tf.add_to_collection("input_placehold",self.content_seq_vec)
+        tf.add_to_collection("input_placehold",self.title_seq_vec)
+
+
+
         self.init_loss=9999
         self.best_loss=9999
         self.best_iter=0
         #构建encoder层词向量矩阵变量
         self.embeding_content=tf.Variable(tf.random_uniform(shape=(self.content_vocab_len,self.init_dim),
-                                                    dtype=tf.float32))
+                                                    dtype=tf.float32),name="embedding_content")
         # 构建decoder层词向量矩阵变量
         self.embeding_title=tf.Variable(tf.random_uniform(shape=(self.title_vocab_len,self.init_dim),
-                                                    dtype=tf.float32))
+                                                    dtype=tf.float32),name="embedding_title")
+        tf.add_to_collection("embedding",self.embeding_content)
+        tf.add_to_collection("embedding",self.embeding_title)
+
         # 定义lstm 单元
-        self.cell = tf.contrib.rnn.LSTMCell(self.hidden_dim,
-                                         initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                         state_is_tuple=True)
+        if FLAGS.encoder_mod in ["lstm",'lstmTF']:
+            self.cell = tf.contrib.rnn.LSTMCell(self.hidden_dim,
+                                             initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                             state_is_tuple=True)
+            tf.add_to_collection('lstm_cell',self.cell)
+        elif FLAGS.encoder_mod in ['bilstm']:
+            self.cell_f = tf.contrib.rnn.LSTMCell(self.hidden_dim,
+                                             initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                             state_is_tuple=True)
+            self.cell_b = tf.contrib.rnn.LSTMCell(self.hidden_dim,
+                                             initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                             state_is_tuple=True)
+
+            self.cell_decoder = tf.contrib.rnn.LSTMCell(2*self.hidden_dim,
+                                             initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
+                                             state_is_tuple=True)
 
         self.content_emb_input=tf.nn.embedding_lookup(self.embeding_content,self.content_input)
         self.content_emb_decoder=tf.nn.embedding_lookup(self.embeding_content,self.content_decoder)
         self.title_emb=tf.nn.embedding_lookup(self.embeding_title,self.title)
+
         # self.Encoder_Decoder()
         encoder_outs,encoder_state_c,encoder_state_h=self.Encoder()
+        tf.add_to_collection('encoder_output',encoder_outs)
+        tf.add_to_collection('encoder_state_c',encoder_state_c)
+        tf.add_to_collection('encoder_state_h',encoder_state_h)
+
         self.encoder_outs=encoder_outs
         self.encoder_state_c=encoder_state_c
         self.encoder_state_h=encoder_state_h
@@ -108,12 +138,17 @@ class Seq2Seq(object):
 
         decoder_out,decoder_state=self.Decoder(encoder_outs,encoder_state_c,encoder_state_h)
         self.loss=self.Loss(decoder_out,self.content_decoder)
+        print(self.loss.graph)
         tf.summary.scalar("loss_my",self.loss)
         self.opt=tf.train.AdamOptimizer(FLAGS.learning_rate).minimize(self.loss)
         self.merge_summary=tf.summary.merge_all()
 
     def beam_decoder(self):
         # 解码阶段
+        if FLAGS.encoder_mod == 'lstm':
+            cell=self.cell
+        elif FLAGS.encoder_mod == 'bilstm':
+            cell=self.cell_decoder
         self.beam_state_c = tf.placeholder(shape=(None, self.hidden_dim), dtype=tf.float32)
         self.beam_state_h = tf.placeholder(shape=(None, self.hidden_dim), dtype=tf.float32)
         self.beam_inputs = tf.placeholder(shape=(None,), dtype=tf.int32)
@@ -125,7 +160,7 @@ class Seq2Seq(object):
             decoder_inputs=[emb_beam_decoder],
             initial_state=beam_state,
             attention_states=self.beam_encoder,
-            cell=self.cell,
+            cell=cell,
         )
         outs = tf.stack(outs, 1)
         ll = tf.einsum('ijk,kl->ijl', outs, tf.transpose(self.w))
@@ -165,13 +200,8 @@ class Seq2Seq(object):
         '''
         lstm_input=tf.unstack(self.title_emb,self.title_len,1)
         if FLAGS.encoder_mod=="bilstm":
-            cell_f=tf.contrib.rnn.LSTMCell(self.hidden_dim,
-                                            initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                            state_is_tuple=True)
-            cell_b=tf.contrib.rnn.LSTMCell(self.hidden_dim,
-                                            initializer=tf.random_uniform_initializer(-0.1, 0.1, seed=123),
-                                            state_is_tuple=True)
-            (out, fw_state, bw_state) = tf.contrib.rnn.static_bidirectional_rnn(cell_f, cell_b, lstm_input,
+
+            (out, fw_state, bw_state) = tf.contrib.rnn.static_bidirectional_rnn(self.cell_f, self.cell_b, lstm_input,
                                                                          dtype=tf.float32,
                                                                          sequence_length=self.title_seq_vec)
 
@@ -235,7 +265,7 @@ class Seq2Seq(object):
         :return: 
         '''
 
-        if FLAGS.encoder_mod in ['lstm','bilstm','cnn']:
+        if FLAGS.encoder_mod in ['lstm','cnn']:
             decoder_list = tf.unstack(self.content_emb_input, self.content_len, 1)
             encoder_state = (encoder_state_c, encoder_state_h)
             decoder_out, decoder_state = tf.contrib.legacy_seq2seq.attention_decoder(
@@ -243,6 +273,17 @@ class Seq2Seq(object):
                 initial_state=encoder_state,
                 attention_states=encoder_out,
                 cell=self.cell,
+                output_size=None,
+            )
+        elif FLAGS.encoder_mod in ['bilstm']:
+
+            decoder_list = tf.unstack(self.content_emb_input, self.content_len, 1)
+            encoder_state = (encoder_state_c, encoder_state_h)
+            decoder_out, decoder_state = tf.contrib.legacy_seq2seq.attention_decoder(
+                decoder_inputs=decoder_list,
+                initial_state=encoder_state,
+                attention_states=encoder_out,
+                cell=self.cell_decoder,
                 output_size=None,
             )
         else:
@@ -272,8 +313,8 @@ class Seq2Seq(object):
             self.w = tf.Variable(tf.random_uniform(shape=(self.num_class, 2*self.hidden_dim), dtype=tf.float32))
             self.b = tf.Variable(tf.random_uniform(shape=(self.num_class,), dtype=tf.float32))
             logits=tf.stack(logit_list,1)
-            ll = tf.einsum('ijk,kl->ijl', logits, tf.transpose(w))
-            self.softmax_logit = tf.nn.softmax(tf.add(ll, b), 1)
+            ll = tf.einsum('ijk,kl->ijl', logits, tf.transpose(self.w))
+            self.softmax_logit = tf.nn.softmax(tf.add(ll, self.b), 1)
             if not FLAGS.sample_loss:
                 label_one_hot=tf.one_hot(label,self.content_vocab_len,1,0,2)
                 loss=tf.losses.softmax_cross_entropy(logits=self.softmax_logit,onehot_labels=label_one_hot)
@@ -510,8 +551,11 @@ class Seq2Seq(object):
                         beam_inputs.append(next_input)
 
                     print(self.socre)
-                    print(self.beam_path)
-                    print(return_content_decoder[batch_index])
+                    print([id2content[e] for e in return_title[batch_index]])
+                    print([list(map(lambda x:id2content[x],ele))for ele in self.beam_path])
+
+                    # print(self.beam_path)
+                    print([id2content[e] for e in return_content_decoder[batch_index]])
                     print('*'*10)
 
 def main(_):
